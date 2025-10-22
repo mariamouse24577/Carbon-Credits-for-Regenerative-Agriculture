@@ -15,6 +15,8 @@
 (define-constant ERR_ALREADY_VERIFIED (err u106))
 (define-constant ERR_NOT_VERIFIED (err u107))
 (define-constant ERR_TRANSFER_FAILED (err u108))
+(define-constant ERR_INVALID_RATING (err u112))
+(define-constant ERR_FARM_ALREADY_RATED (err u113))
 
 (define-data-var total-farms uint u0)
 (define-data-var total-credits-issued uint u0)
@@ -52,6 +54,24 @@
 )
 
 (define-map authorized-verifiers principal bool)
+
+(define-map farm-ratings
+  {farm: principal, rater: principal}
+  {
+    rating: uint,
+    comment: (string-ascii 50),
+    rating-date: uint
+  }
+)
+
+(define-map farm-reputation-summary
+  {farm: principal}
+  {
+    total-ratings: uint,
+    average-rating: uint,
+    last-rating-date: uint
+  }
+)
 
 (define-data-var next-offset-id uint u1)
 
@@ -250,6 +270,62 @@
 
 (define-read-only (get-contract-owner)
   (ok CONTRACT_OWNER)
+)
+
+(define-public (rate-farm (farm principal) (rating uint) (comment (string-ascii 50)))
+  (let
+    ((farm-exists (map-get? farms farm))
+     (existing-rating (map-get? farm-ratings {farm: farm, rater: tx-sender}))
+     (current-summary (map-get? farm-reputation-summary {farm: farm})))
+    (if (not (is-some farm-exists))
+      ERR_FARM_NOT_FOUND
+      (if (is-some existing-rating)
+        ERR_FARM_ALREADY_RATED
+        (if (or (< rating u1) (> rating u5))
+          ERR_INVALID_RATING
+          (let
+            ((total (if (is-some current-summary) (+ (get total-ratings (unwrap-panic current-summary)) u1) u1))
+             (prev-avg (if (is-some current-summary) (get average-rating (unwrap-panic current-summary)) u0))
+             (new-avg (/ (+ (* prev-avg (- total u1)) rating) total)))
+            (begin
+              (map-set farm-ratings
+                {farm: farm, rater: tx-sender}
+                {
+                  rating: rating,
+                  comment: comment,
+                  rating-date: stacks-block-height
+                }
+              )
+              (map-set farm-reputation-summary
+                {farm: farm}
+                {
+                  total-ratings: total,
+                  average-rating: new-avg,
+                  last-rating-date: stacks-block-height
+                }
+              )
+              (ok true)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-read-only (get-farm-rating (farm principal) (rater principal))
+  (map-get? farm-ratings {farm: farm, rater: rater})
+)
+
+(define-read-only (get-farm-reputation-summary (farm principal))
+  (map-get? farm-reputation-summary {farm: farm})
+)
+
+(define-read-only (get-farm-average-rating (farm principal))
+  (let
+    ((summary (map-get? farm-reputation-summary {farm: farm})))
+    (ok (if (is-some summary) (get average-rating (unwrap-panic summary)) u0))
+  )
 )
 
 (define-private (is-valid-practice (practice (string-ascii 30)))
