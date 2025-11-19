@@ -15,10 +15,16 @@
 (define-constant ERR_ALREADY_VERIFIED (err u106))
 (define-constant ERR_NOT_VERIFIED (err u107))
 (define-constant ERR_TRANSFER_FAILED (err u108))
+(define-constant ERR_PERIOD_NOT_ACTIVE (err u109))
+(define-constant ERR_EMPTY_BATCH (err u110))
+(define-constant ERR_BATCH_TOO_LARGE (err u111))
 
 (define-data-var total-farms uint u0)
 (define-data-var total-credits-issued uint u0)
 (define-data-var carbon-price uint u1000000)
+(define-data-var current-period-id uint u1)
+(define-data-var current-period-start uint u0)
+(define-data-var current-period-end uint u0)
 
 (define-map farms principal 
   {
@@ -53,6 +59,43 @@
 
 (define-map authorized-verifiers principal bool)
 
+(define-map farm-performance principal
+  {
+    total-verifications: uint,
+    current-streak: uint,
+    max-streak: uint,
+    average-credits: uint,
+    last-verified: uint,
+    period-id: uint,
+    performance-score: uint
+  }
+)
+
+(define-map verification-periods uint
+  {
+    period-start: uint,
+    period-end: uint,
+    farms-verified: uint,
+    total-credits: uint
+  }
+)
+
+(define-map period-farm-credits {period-id: uint, farm: principal}
+  {
+    credits-earned: uint,
+    verification-count: uint
+  }
+)
+
+(define-map batch-verifications {batch-id: uint, farm: principal}
+  {
+    credits-awarded: uint,
+    batch-date: uint,
+    verifier: principal
+  }
+)
+
+(define-data-var next-batch-id uint u1)
 (define-data-var next-offset-id uint u1)
 
 (define-public (register-farm 
@@ -102,7 +145,28 @@
   )
 )
 
-(define-public (verify-farm 
+(define-public (start-verification-period (period-duration uint))
+  (if (is-eq tx-sender CONTRACT_OWNER)
+    (let ((period-id (var-get current-period-id))
+          (start-block stacks-block-height))
+      (begin
+        (map-set verification-periods period-id {
+          period-start: start-block,
+          period-end: (+ start-block period-duration),
+          farms-verified: u0,
+          total-credits: u0
+        })
+        (var-set current-period-id (+ period-id u1))
+        (var-set current-period-start start-block)
+        (var-set current-period-end (+ start-block period-duration))
+        (ok period-id)
+      )
+    )
+    ERR_UNAUTHORIZED
+  )
+)
+
+(define-public (verify-farm
   (farm principal)
   (credits-to-award uint)
   (practice (string-ascii 30))
@@ -135,6 +199,32 @@
           )
           ERR_INVALID_AMOUNT
         )
+      )
+      ERR_UNAUTHORIZED
+    )
+  )
+)
+
+(define-public (batch-verify-farms 
+  (farms-list (list 50 principal))
+  (credits-list (list 50 uint))
+)
+  (let
+    ((batch-id (var-get next-batch-id))
+     (is-authed (default-to false (map-get? authorized-verifiers tx-sender))))
+    (if is-authed
+      (if (is-eq (len farms-list) (len credits-list))
+        (if (> (len farms-list) u0)
+          (if (< (len farms-list) u51)
+            (begin
+              (var-set next-batch-id (+ batch-id u1))
+              (ok batch-id)
+            )
+            ERR_BATCH_TOO_LARGE
+          )
+          ERR_EMPTY_BATCH
+        )
+        ERR_INVALID_AMOUNT
       )
       ERR_UNAUTHORIZED
     )
@@ -212,6 +302,40 @@
   )
 )
 
+(define-public (calculate-farm-performance (farm principal))
+  (let
+    ((existing-perf (map-get? farm-performance farm))
+     (farm-data (map-get? farms farm))
+     (current-period (var-get current-period-id)))
+    (if (is-some farm-data)
+      (let ((farm-info (unwrap-panic farm-data))
+            (perf-data (default-to 
+              {total-verifications: u0, current-streak: u0, max-streak: u0, average-credits: u0, last-verified: u0, period-id: u0, performance-score: u0}
+              existing-perf)))
+        (let ((new-streak (if (is-eq (get period-id perf-data) current-period) (get current-streak perf-data) u1))
+              (max-streak (if (> new-streak (get max-streak perf-data)) new-streak (get max-streak perf-data)))
+              (avg-credits (if (> (get total-verifications perf-data) u0) 
+                (/ (get credits-earned farm-info) (+ (get total-verifications perf-data) u1))
+                (get credits-earned farm-info))))
+          (begin
+            (map-set farm-performance farm {
+              total-verifications: (+ (get total-verifications perf-data) u1),
+              current-streak: (+ new-streak u1),
+              max-streak: max-streak,
+              average-credits: avg-credits,
+              last-verified: stacks-block-height,
+              period-id: current-period,
+              performance-score: (* avg-credits max-streak)
+            })
+            (ok true)
+          )
+        )
+      )
+      ERR_FARM_NOT_FOUND
+    )
+  )
+)
+
 (define-read-only (get-farm-info (farm principal))
   (map-get? farms farm)
 )
@@ -250,6 +374,23 @@
 
 (define-read-only (get-contract-owner)
   (ok CONTRACT_OWNER)
+)
+
+(define-read-only (get-farm-performance (farm principal))
+  (map-get? farm-performance farm)
+)
+
+(define-read-only (get-verification-streak (farm principal))
+  (let ((perf-data (map-get? farm-performance farm)))
+    (if (is-some perf-data)
+      (ok (get current-streak (unwrap-panic perf-data)))
+      (ok u0)
+    )
+  )
+)
+
+(define-read-only (get-period-performance (period-id uint))
+  (map-get? verification-periods period-id)
 )
 
 (define-private (is-valid-practice (practice (string-ascii 30)))
